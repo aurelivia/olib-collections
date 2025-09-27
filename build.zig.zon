@@ -1,0 +1,11 @@
+.{
+    .name = .olib_collections,
+    .version = "0.0.0",
+    .fingerprint = 0xe6b2f5ec3c39146e,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
