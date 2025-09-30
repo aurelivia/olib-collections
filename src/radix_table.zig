@@ -64,14 +64,16 @@ pub fn getOrPut(self: *@This(), mem: Allocator, input: []const u8) Allocator.Err
         var bit_len: usize = 0;
         var bit: u8 = 0x80;
 
-        const order: std.math.Order = while (bit_len < min) {
-            const cmp = std.math.order(
-                root.bytes[root.start_byte + byte] & bit,
-                input[input_start_byte + byte] & bit
-            );
-            if (cmp != .eq) break cmp;
-            bit >>= 1; bit_len += 1;
-            if (bit == 0) { bit = 0x80; byte += 1; }
+        const order: std.math.Order = inner: while (bit_len < min) {
+            const root_byte = root.bytes[root.start_byte + byte];
+            const input_byte = input[input_start_byte + byte];
+            if (root_byte == input_byte) { bit_len += 8; byte += 1; continue :inner; }
+            while (bit != 0) {
+                const cmp = std.math.order(root_byte & bit, input_byte & bit);
+                if (cmp != .eq) break :inner cmp;
+                bit >>= 1; bit_len += 1;
+            }
+            bit = 0x80; byte += 1;
         } else if (input_len > root_len) { // Root is prefix of input
             const dir = (input[input_start_byte + byte] & bit) != 0;
             const branch = if (dir) root.one else root.zero;
