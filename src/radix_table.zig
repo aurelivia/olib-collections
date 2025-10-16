@@ -2,7 +2,6 @@ const std = @import("std");
 const log = std.log.scoped(.@"olib-collections");
 const Allocator = std.mem.Allocator;
 
-const byte_align: std.mem.Alignment = std.mem.Alignment.fromByteUnits(@alignOf(u8));
 
 pub const Node = struct {
     bytes: []const u8,
@@ -18,25 +17,22 @@ pub const Node = struct {
     }
 };
 
-mut: std.Thread.RwLock = .{},
-snapshot: u16 = 0,
+rw: @import("./mutability_lock.zig") = .{},
 nodes: std.ArrayList(Node) = .empty,
 root: usize = 0,
 
 pub fn deinit(self: *@This(), mem: Allocator) void {
-    self.mut.lock();
-    defer self.mut.unlock();
+    self.rw.lockMut();
+    defer self.rw.unlockMut();
     for (self.nodes.items) |*node| node.deinit(mem);
     self.nodes.deinit(mem);
 }
 
 pub fn getOrPut(self: *@This(), mem: Allocator, input: []const u8) Allocator.Error!usize {
-    self.mut.lockShared();
+    self.rw.lock();
     if (self.nodes.items.len == 0) {
-        const snap = self.snapshot;
-        self.mut.unlockShared(); self.mut.lock();
-        if (snap == self.snapshot) {
-            defer self.mut.unlock();
+        if (self.rw.toMut()) {
+            defer self.rw.unlockMut();
             const bytes = try mem.alloc(u8, input.len);
             errdefer mem.free(bytes);
             @memcpy(bytes, input);
@@ -45,9 +41,8 @@ pub fn getOrPut(self: *@This(), mem: Allocator, input: []const u8) Allocator.Err
                 .bit_len = bytes.len * 8,
                 .managed = true
             });
-            self.snapshot +%= 1;
             return self.root;
-        } else { self.mut.unlock(); self.mut.lockShared(); }
+        }
     }
 
     var root_pos: usize = self.root;
@@ -86,15 +81,12 @@ pub fn getOrPut(self: *@This(), mem: Allocator, input: []const u8) Allocator.Err
                 continue :outer;
             } else {
                 // Test: Adding Branch
-                const snap = self.snapshot;
-                self.mut.unlockShared();
-                self.mut.lock();
-                errdefer self.mut.unlock();
-                if (self.snapshot != snap) {
-                    self.mut.unlock(); self.mut.lockShared();
+                if (!self.rw.toMut()) {
+                    self.rw.lock();
                     root_pos = self.root; parent_pos = null; input_start_byte = 0;
                     continue :outer;
                 }
+                defer self.rw.unlockMut();
 
                 const byte_len = input.len - byte;
                 const bytes = try mem.alloc(u8, byte_len);
@@ -110,22 +102,16 @@ pub fn getOrPut(self: *@This(), mem: Allocator, input: []const u8) Allocator.Err
 
                 const new = self.nodes.items.len - 1;
                 if (dir) self.nodes.items[root_pos].one = new else self.nodes.items[root_pos].zero = new;
-
-                self.snapshot +%= 1;
-                self.mut.unlock();
                 return new;
             }
         } else if (input_len < root_len) { // Input is prefix of root
             // Test: Adding Prefix
-            const snap = self.snapshot;
-            self.mut.unlockShared();
-            self.mut.lock();
-            errdefer self.mut.unlock();
-            if (self.snapshot != snap) {
-                self.mut.unlock(); self.mut.lockShared();
+            if (!self.rw.toMut()) {
+                self.rw.lock();
                 root_pos = self.root; parent_pos = null; input_start_byte = 0;
                 continue :outer;
             }
+            defer self.rw.unlockMut();
 
             const dir = (root.bytes[root.start_byte + byte] & bit) != 0;
             const bytes = root.bytes[root.start_byte..byte];
@@ -148,26 +134,20 @@ pub fn getOrPut(self: *@This(), mem: Allocator, input: []const u8) Allocator.Err
             if (parent_pos) |p| {
                 if (parent_leaf_one) self.nodes.items[p].one = new else self.nodes.items[p].zero = new;
             } else self.root = new;
-
-            self.snapshot +%= 1;
-            self.mut.unlock();
             return new;
         } else { // Exact match
-            self.mut.unlockShared();
+            self.rw.unlock();
             return root_pos;
         };
 
         // Test: Common Prefix
         // Common prefix between root and input
-        const snap = self.snapshot;
-        self.mut.unlockShared();
-        self.mut.lock();
-        errdefer self.mut.unlock();
-        if (self.snapshot != snap) {
-            self.mut.unlock(); self.mut.lockShared();
+        if (!self.rw.toMut()) {
+            self.rw.lock();
             root_pos = self.root; parent_pos = null; input_start_byte = 0;
             continue :outer;
         }
+        defer self.rw.unlockMut();
 
         const byte_len = input.len - byte;
         const bytes = try mem.alloc(u8, byte_len);
@@ -203,9 +183,6 @@ pub fn getOrPut(self: *@This(), mem: Allocator, input: []const u8) Allocator.Err
         if (parent_pos) |p| {
             if (parent_leaf_one) self.nodes.items[p].one = new else self.nodes.items[p].zero = new;
         } else self.root = new;
-
-        self.snapshot +%= 1;
-        self.mut.unlock();
         return pos;
     }
 }

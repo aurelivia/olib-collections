@@ -1,5 +1,5 @@
 const std = @import("std");
-const Mem = std.mem.Allocator;
+const Allocator = std.mem.Allocator;
 
 pub fn Queue(comptime T: type) type { return struct {
     pub const Node = struct {
@@ -38,12 +38,12 @@ pub fn Queue(comptime T: type) type { return struct {
         head: ?*Node = null,
         last: ?*Node = null,
 
-        pub fn deinit(self: *@This(), mem: Mem) void {
+        pub fn deinit(self: *@This(), mem: Allocator) void {
             self.clear(mem);
             self.managed = false;
         }
 
-        pub fn clear(self: *@This(), mem: Mem) void {
+        pub fn clear(self: *@This(), mem: Allocator) void {
             var last: ?*Node = popNode(&(self.head), &(self.last));
             while (last) |l| {
                 mem.destroy(l);
@@ -54,10 +54,10 @@ pub fn Queue(comptime T: type) type { return struct {
 
     pub var pool: Pool = .{};
 
-    head: ?*Node = null,
-    last: ?*Node = null,
+    head: ?*Node,
+    last: ?*Node,
 
-    pub fn deinit(self: *@This(), mem: Mem) void {
+    pub fn deinit(self: *@This(), mem: Allocator) void {
         self.clear();
         pool.instances -= 1;
         if (!pool.managed and pool.instances == 0) pool.clear(mem);
@@ -65,10 +65,10 @@ pub fn Queue(comptime T: type) type { return struct {
 
     pub fn init() @This() {
         pool.instances += 1;
-        return .{};
+        return .{ .head = null, .last = null };
     }
 
-    pub fn push(self: *@This(), mem: Mem, val: T) Mem.Error!void {
+    pub fn push(self: *@This(), mem: Allocator, val: T) Allocator.Error!void {
         const node: *Node = if (popNode(&(pool.head), &(pool.last))) |n| b: {
             n.val = val;
             break :b n;
