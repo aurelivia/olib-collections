@@ -1,433 +1,431 @@
 const std = @import("std");
-const UQueue = @import("./queue.zig").UQueue;
+const log = std.log.scoped(.@"olib-collections");
+const Allocator = std.mem.Allocator;
+const Queue = @import("./queue.zig").Queue;
 
-pub fn Table(comptime T: type) type {
-    return struct {
-        const Self = @This();
+pub fn Table(comptime T: type, comptime BackingInt: type) type { return struct {
+    comptime {
+        switch (@typeInfo(BackingInt)) {
+            .int => |int| if (int.signedness == .signed) @compileError("Backing integers may not be signed.")
+                else if (int.bits < 16) @compileError("Backing integers must be at least u16."),
+            else => @compileError(@typeName(BackingInt) ++ " is not a valid backing integer type (only unsigned integers are allowed).")
+        }
+    }
 
-        pub const Index = u32;
-        pub const Generation = u16;
+    pub const Key = packed struct (BackingInt) {
+        pub const generation_bits = @min(@divFloor(@typeInfo(BackingInt).int.bits, 3), 16);
+        pub const index_bits = @typeInfo(BackingInt).int.bits - generation_bits;
+        pub const Generation = @Type(std.builtin.Type.Int{ .signedness = .unsigned, .bits = generation_bits });
+        pub const Index = @Type(std.builtin.Type.Int{ .signedness = .unsigned, .bits = index_bits });
 
-        pub const Key = packed struct(u48) {
-            generation: Generation,
-            index: Index
+        generation: Generation,
+        index: Index
+    };
+
+    const is_multi = @typeInfo(T) == .@"struct" and @typeInfo(T).@"struct".layout != .@"packed";
+    const Items = if (is_multi) std.MultiArrayList(T) else std.ArrayList(T);
+
+    rw: @import("./mutability_lock.zig"),
+    items: Items,
+    living: std.bit_set.DynamicBitSetUnmanaged,
+    generation: std.ArrayList(Key.Generation),
+    recycle: Queue(Key.Generation),
+
+    pub fn deinit(self: *@This(), mem: Allocator) void {
+        self.rw.lockMut();
+        defer self.rw.unlockMut();
+        self.items.deinit(mem);
+        self.living.deinit(mem);
+        self.generation.deinit(mem);
+        self.recycle.deinit(mem);
+    }
+
+    pub inline fn init(mem: Allocator) Allocator.Error!@This() {
+        return initCapacity(mem, 0);
+    }
+
+    pub fn initCapacity(mem: Allocator, size: Key.Index) Allocator.Error!@This() {
+        var table = .{
+            .rw = .{},
+            .items = .empty,
+            .living = try .initEmpty(mem, size),
+            .generation = .empty,
+            .recycle = .{}
         };
+        errdefer table.deinit(mem);
+        try table.items.ensureTotalCapacity(mem, size);
+        table.generation = try .initCapacity(mem, size);
+        return table;
+    }
 
-        // fn itemsFunctions(comptime I: type, comptime IT: type) type {
-        //     return struct {
-        //         pub inline fn assertValid(self: *Items) void {
-        //             std.debug.assert(self.parentValid.*);
-        //         }
-        //
-        //         pub inline fn exists(self: *I, key: Key) bool {
-        //             return self.source.exists(key);
-        //         }
-        //
-        //         pub inline fn get(self: *I, key: Key) ?IT {
-        //             self.assertValid();
-        //             if (self.exists(key)) return self.items[key.index];
-        //             return null;
-        //         }
-        //     };
-        // }
-        //
-        // pub fn Items(comptime IT: type) type {
-        //     return struct {
-        //         source: *Self = undefined,
-        //         items: []IT = undefined,
-        //         parentValid: *bool = undefined,
-        //
-        //         const itemFn = itemsFunctions(Items, IT);
-        //         const assertValid = itemFn.assertValid;
-        //         pub const exists = itemFn.exists;
-        //         pub const get = itemFn.get;
-        //     };
-        // }
-        //
-        // pub fn ItemsMut(comptime IT: type) type {
-        //     return struct {
-        //         source: *Self = undefined,
-        //         items: []IT = undefined,
-        //         parentValid: *bool = undefined,
-        //
-        //         const itemFn = itemsFunctions(ItemsMut, IT);
-        //         const assertValid = itemFn.assertValid;
-        //         pub const exists = itemFn.exists;
-        //         pub const get = itemFn.get;
-        //
-        //         pub inline fn trySet(self: *@This(), key: Key, val: IT) bool {
-        //             self.assertValid();
-        //             if (self.exists(key)) { self.items[key.index] = val; return true; }
-        //             return false;
-        //         }
-        //
-        //         pub inline fn set(self: *@This(), key: Key, val: IT) void {
-        //             self.assertValid();
-        //             if (!self.exists(key)) unreachable;
-        //             self.items[key.index] = val;
-        //         }
-        //     };
-        // }
-        //
-        fn sliceFunctions(comptime S: type) type {
-            return struct {
-                pub inline fn assertValid(self: *const S) void {
-                    std.debug.assert(if (self.parentValid) |pv| pv.* else self.valid);
-                }
+    pub inline fn len(self: *const @This()) Key.Index {
+        return if (is_multi) self.items.len else self.items.items.len;
+    }
 
-                pub inline fn exists(self: *const S, key: Key) bool {
-                    return self.source.exists(key);
-                }
+    inline fn modItemsLen(self: *@This(), mod: isize) void {
+        if (is_multi) self.items.len += mod else self.items.items.len += mod;
+    }
 
-                pub inline fn get(self: *const S, key: Key) ?T {
-                    self.assertValid();
-                    if (self.exists(key)) return self.slice.get(key.index);
-                    return null;
-                }
-
-                // pub inline fn items(self: *const S, comptime field: std.meta.FieldEnum(T)) Items(std.meta.FieldType(T, field)) {
-                //     return .{
-                //         .source = &(self.source),
-                //         .items = self.slice.items(field),
-                //         .parentValid = if (self.parentValid) |pv| pv else &self.valid
-                //     };
-                // }
-                //
-                pub inline fn iter(self: *const S) Iter {
-                    return .{
-                        .source = self.source,
-                        .slice = self.slice,
-                        .parentValid = if (self.parentValid) |pv| pv else &self.valid
-                    };
-                }
-            };
+    fn awaitNewLocked(self: *@This(), mem: Allocator) Allocator.Error!Key {
+        while (self.recycle.pop()) |rec| {
+            if (rec.index < self.items.len and !self.living.isSet(rec.index)) {
+                const gen = self.generation.items[rec.index] +% 1;
+                self.generation.items[rec.index] = gen;
+                return .{ .index = rec.index, .generation = gen };
+            }
         }
 
-        pub const Slice = struct {
-            source: *Self = undefined,
-            slice: std.MultiArrayList(T).Slice = undefined,
-            valid: bool = true,
-            parentValid: ?*bool = null,
-
-            pub inline fn release(self: *Slice) void {
-                std.debug.assert(self.parentValid == null and self.valid == true);
-                self.valid = false; self.source.mut.unlockShared();
-            }
-
-            const sliceFn = sliceFunctions(Slice);
-            const assertValid = sliceFn.assertValid;
-            pub const exists = sliceFn.exists;
-            pub const get = sliceFn.get;
-            // pub const items = sliceFn.items;
-            pub const iter = sliceFn.iter;
-        };
-
-        fn mutFunctions(comptime S: type) type {
-            return struct {
-                pub inline fn create(self: *S, val: T) !Key {
-                    self.assertValid();
-                    const key = self.source._awaitNew();
-                    self.set(key, val);
-                    return key;
-                }
-
-                pub inline fn destroy(self: *S, key: Key) void {
-                    self.assertValid();
-                    self.source.recycle.push(self.mem, key.index).?;
-                    self.source.valid.unset(key.index);
-                    if (key.index == self.source.items.len - 1) self.source.items.len -= 1;
-                }
-
-                pub inline fn set(self: *S, key: Key, val: T) void {
-                    self.assertValid();
-                    self.slice.set(key.index, val);
-                    self.source.valid.set(key.index);
-                }
-
-            };
+        if (self.len() == self.items.capacity) {
+            std.debug.assert(self.items.len < std.math.maxInt(Key.Index));
+            try self.items.ensureUnusedCapacity(mem, 1);
+            try self.living.resize(mem, self.items.capacity, false);
+            try self.generation.ensureTotalCapacityPrecise(mem, self.items.capacity);
         }
 
-        pub const SliceMut = struct {
-            source: *Self = undefined,
-            slice: std.MultiArrayList(T).Slice = undefined,
-            valid: bool = true,
-            parentValid: ?*bool = null,
+        self.modItemsLen(1);
+        const newlen = self.len();
+        self.generation.items.len = newlen;
+        self.generation.items[newlen - 1] = 0;
+        return .{ .index = @as(Key.Index, @intCast(len - 1)), .generation = 0 };
+    }
 
-            pub inline fn release(self: *SliceMut) void {
-                std.debug.assert(self.parentValid == null and self.valid == true);
-                self.valid = false; self.source.mut.unlock();
+    pub fn awaitNew(self: *@This(), mem: Allocator) Allocator.Error!Key {
+        self.rw.lockMut();
+        defer self.rw.unlockMut();
+        return try self.awaitNewLocked(mem);
+    }
+
+    fn createLocked(self: *@This(), mem: Allocator, val: T) Allocator.Error!Key {
+        const key = try self.awaitNewLocked(mem);
+        self.setLocked(key, val);
+        return key;
+    }
+
+    pub fn create(self: *@This(), mem: Allocator, val: T) Allocator.Error!Key {
+        self.rw.lockMut();
+        defer self.rw.unlockMut();
+        return try self.createLocked(mem, val);
+    }
+
+    fn getLocked(self: *const @This(), key: Key) ?T {
+        if (self.exists(key)) return if (is_multi) self.items.get(key.index) else self.items.items[key.index];
+        return null;
+    }
+
+    pub fn get(self: *const @This(), key: Key) ?T {
+        self.rw.lock();
+        defer self.rw.unlock();
+        return self.getLocked(key);
+    }
+
+    fn setLocked(self: *@This(), key: Key, val: T) void {
+        if (is_multi) self.items.set(key.index, val) else self.items.items[key.index] = val;
+        self.living.set(key.index);
+    }
+
+    pub fn set(self: *@This(), key: Key, val: T) void {
+        self.rw.lockMut();
+        defer self.rw.unlockMut();
+        self.setLocked(key, val);
+    }
+
+    fn destroyLocked(self: *@This(), mem: Allocator, key: Key) void {
+        self.recycle.push(mem, key) catch {};
+        self.living.unset(key.index);
+        if (key.index == self.len() - 1) self.modItemsLen(-1);
+    }
+
+    pub fn destroy(self: *@This(), mem: Allocator, key: Key) void {
+        self.rw.lockMut();
+        defer self.rw.unlockMut();
+        self.destroyLocked(mem, key);
+    }
+
+    pub fn clear(self: *@This()) void {
+        self.rw.lockMut();
+        defer self.rw.unlockMut();
+        self.items.clearRetainingCapacity();
+        self.living.unsetAll();
+        self.generation.clearRetainingCapacity();
+        self.recycle.clear();
+    }
+
+    pub fn clearFree(self: *@This(), mem: Allocator) void {
+        self.rw.lockMut();
+        defer self.rw.unlockMut();
+        self.items.clearAndFree(mem);
+        self.living.resize(mem, 0, false).?;
+        self.generation.clearAndFree(mem);
+        self.recycle.clear();
+    }
+
+    pub fn trim(self: *@This(), mem: Allocator) void {
+        if (self.items.len *| 2 >= self.items.capacity) return;
+        self.rw.lockMut();
+        defer self.rw.unlockMut();
+        self.items.shrinkAndFree(mem, @divFloor(self.items.capacity, 1));
+        std.debug.assert(self.items.capacity <= self.living.bit_length);
+        self.living.resize(mem, self.items.capacity, false) catch unreachable;
+        self.generation.shrinkAndFree(mem, self.items.capacity);
+    }
+
+    pub fn slice(self: *const @This()) Slice {
+        self.rw.lock();
+        return .{
+            .source = self,
+            .inner_slice = if (is_multi) self.items.slice() else {},
+            .valid = true,
+            .rootValid = null,
+            .release = Slice.releaseInner
+        };
+    }
+
+    pub fn sliceMut(self: *@This()) SliceMut {
+        self.rw.lockMut();
+        return .{
+            .source = self,
+            .inner_slice = if (is_multi) self.items.slice() else {},
+            .valid = true,
+            .rootValid = null,
+            .release = SliceMut.releaseInner
+        };
+    }
+
+    pub fn iter(self: *const @This()) Iter {
+        self.rw.lock();
+        return .{
+            .source = self,
+            .inner_slice = if (is_multi) self.items.slice() else {},
+            .index = 0,
+            .valid = true,
+            .rootValid = null,
+            .release = Iter.releaseInner
+        };
+    }
+
+    pub fn iterMut(self: *@This()) IterMut {
+        self.rw.lockMut();
+        return .{
+            .source = self,
+            .inner_slice = if (is_multi) self.items.slice() else {},
+            .index = 0,
+            .valid = true,
+            .rootValid = null,
+            .release = IterMut.releaseInner
+        };
+    }
+
+    fn SliceFunctions(comptime Slc: type) type { return struct {
+        inline fn assertValid(self: *const Slc) void {
+            if ((if (self.rootValid) |pv| pv.* else self.valid) == false) {
+                std.debug.print("Attempt to use a slice or iterator after it or it's root was released.", .{});
+                unreachable;
             }
+        }
 
-            const sliceFn = sliceFunctions(SliceMut);
-            const assertValid = sliceFn.assertValid;
-            pub const exists = sliceFn.exists;
-            pub const get = sliceFn.get;
-            // pub const items = sliceFn.items;
-            pub const iter = sliceFn.iter;
-            const mutFn = mutFunctions(SliceMut);
-            pub const create = mutFn.create;
-            pub const destroy = mutFn.destroy;
-            pub const set = mutFn.set;
+        pub inline fn exists(self: *const Slc, key: Key) bool {
+            return self.source.exists(key);
+        }
 
-            pub inline fn iterMut(self: *const SliceMut) IterMut {
+        pub inline fn get(self: *const Slc, key: Key) ?T {
+            if (self.source.exists(key))
+                return if (is_multi) self.inner_slice.get(key.index) else self.source.items.items[key.index];
+            return null;
+        }
+
+        pub inline fn iter(self: *const Slc) Iter {
+            return .{
+                .source = self.source,
+                .inner_slice = self.inner_slice,
+                .index = 0,
+                .valid = true,
+                .rootValid = &(self.valid),
+                .release = Iter.releaseInnerDerived
+            };
+        }
+    };}
+
+    pub const Slice = struct {
+        source: *const @This(),
+        inner_slice: if (is_multi) Items.Slice else void,
+        valid: bool,
+        rootValid: ?*bool,
+        release: fn (*const Slice) void,
+
+        pub inline fn releaseInner(self: *const Slice) void {
+            self.assertValid();
+            @constCast(self).valid = false;
+            self.source.rw.unlock();
+        }
+
+        pub inline fn releaseInnerDerived(_: *const Slice) void {
+            comptime { @compileError("Attempt to release a slice that is derived from another. Release the root isntead."); }
+        }
+
+        pub fn toMut(self: *const Slice) ?SliceMut {
+            const snapped = self.source.rw.snapshot.load(.acq);
+            self.release();
+            self.source.rw.lockMut();
+            if (self.source.rw.snapshot.load(.acq) == snapped) {
                 return .{
                     .source = self.source,
-                    .slice = self.slice,
-                    .parentValid = if (self.parentValid) |pv| pv else &self.valid
+                    .inner_slice = if (is_multi) self.items.slice() else {},
+                    .valid = true,
+                    .rootValid = null
                 };
-            }
-        };
-
-        fn iterFunctions(comptime I: type) type {
-            return struct {
-                pub fn next(self: *I) ?Key {
-                    while (!self.done()) {
-                        if (self.source.valid.isSet(self.index)) {
-                            const k: Key = .{ .index = self.index, .generation = self.source.generation.items[self.index] };
-                            self.index += 1;
-                            return k;
-                        }
-                        self.index += 1;
-                    }
-                    return null;
-                }
-
-                pub inline fn done(self: *I) bool {
-                    return self.index >= self.slice.len;
-                }
-
-                pub inline fn reset(self: *I) void {
-                    self.index = 0;
-                }
-
-                pub inline fn subIter(self: *I) I {
-                    return .{
-                        .source = self.source,
-                        .slice = self.slice,
-                        .parentValid = if (self.parentValid) |pv| pv else &self.valid
-                    };
-                }
-
-                pub inline fn subIterFrom(self: *I) I {
-                    var sub = self.subIter();
-                    sub.index = self.index;
-                    return sub;
-                }
-            };
+            } else { self.source.rw.unlockMut(); return null; }
         }
 
-        pub const Iter = struct {
-            source: *Self = undefined,
-            slice: std.MultiArrayList(T).Slice = undefined,
-            valid: bool = true,
-            parentValid: ?*bool = null,
-            index: u32 = 0,
+        const sliceFn = SliceFunctions(Slice);
+        pub const exists = sliceFn.exists;
+        pub const get = sliceFn.get;
+        pub const iter = sliceFn.iter;
+    };
 
-            pub inline fn release(self: *Iter) void {
-                std.debug.assert(self.parentValid == null and self.valid == true);
-                self.valid = false; self.source.mut.unlockShared();
-            }
-
-            const iterFn = iterFunctions(Iter);
-            pub const next = iterFn.next;
-            pub const done = iterFn.done;
-            pub const reset = iterFn.reset;
-            pub const subIter = iterFn.subIter;
-            pub const subIterFrom = iterFn.subIterFrom;
-            const sliceFn = sliceFunctions(Iter);
-            const assertValid = sliceFn.assertValid;
-            pub const exists = sliceFn.exists;
-            pub const get = sliceFn.get;
-            // pub const items = sliceFn.items;
-
-            pub inline fn subSlice(self: *Iter) Slice {
-                return .{
-                    .source = self.source,
-                    .slice = self.slice,
-                    .parentValid = if (self.parentValid) |pv| pv else &self.valid
-                };
-            }
-        };
-
-        pub const IterMut = struct {
-            source: *Self = undefined,
-            slice: std.MultiArrayList(T).Slice = undefined,
-            valid: bool = true,
-            parentValid: ?*bool = null,
-            index: u32 = 0,
-
-            pub inline fn release(self: *IterMut) void {
-                std.debug.assert(self.parentValid == null and self.valid == true);
-                self.valid = false; self.source.mut.unlock();
-            }
-
-            const iterFn = iterFunctions(IterMut);
-            pub const next = iterFn.next;
-            pub const done = iterFn.done;
-            pub const reset = iterFn.reset;
-            pub const subIter = iterFn.subIter;
-            pub const subIterFrom = iterFn.subIterFrom;
-            const sliceFn = sliceFunctions(IterMut);
-            const assertValid = sliceFn.assertValid;
-            pub const exists = sliceFn.exists;
-            pub const get = sliceFn.get;
-            // pub const items = sliceFn.items;
-            const mutFn = mutFunctions(IterMut);
-            pub const create = mutFn.create;
-            pub const destroy = mutFn.destroy;
-            pub const set = mutFn.set;
-        };
-
-        mem: std.mem.Allocator = undefined,
-        mut: std.Thread.RwLock = .{},
-        items: std.MultiArrayList(T) = .{},
-        valid: std.bit_set.DynamicBitSetUnmanaged = .{},
-        generation: std.ArrayListUnmanaged(Generation) = .{},
-        recycle: UQueue(Key) = .{},
-
-        pub fn init(self: *Self, mem: std.mem.Allocator, size: usize) !void {
-            self.mem = mem;
-            self.mut.lock();
-            defer self.mut.unlock();
-            try self.items.ensureTotalCapacity(self.mem, size);
-            errdefer self.items.deinit(self.mem);
-            try self.valid.resize(self.mem, self.items.capacity, false);
-            errdefer self.valid.deinit(self.mem);
-            try self.generation.ensureTotalCapacity(self.mem, self.items.capacity);
-        }
-
-        pub fn deinit(self: *Self) void {
-            self.mut.lock();
-            defer self.mut.unlock();
-            self.items.deinit(self.mem);
-            self.valid.deinit(self.mem);
-            self.generation.deinit(self.mem);
-            self.recycle.deinit(self.mem);
-        }
-
-        pub fn slice(self: *Self) Slice {
-            self.mut.lockShared();
-            return .{
-                .source = self,
-                .slice = self.items.slice()
-            };
-        }
-
-        pub fn sliceMut(self: *Self) SliceMut {
-            self.mut.lock();
-            return .{
-                .source = self,
-                .slice = self.items.slice()
-            };
-        }
-
-        pub fn iter(self: *Self) Iter {
-            self.mut.lockShared();
-            return .{
-                .source = self,
-                .slice = self.items.slice()
-            };
-        }
-
-        pub fn iterMut(self: *Self) IterMut {
-            self.mut.lock();
-            return .{
-                .source = self,
-                .slice = self.items.slice()
-            };
-        }
-
-        pub fn exists(self: *Self, key: Key) bool {
-            return self.valid.isSet(key.index) and self.generation.items[key.index] == key.generation;
-        }
-
-        fn _awaitNew(self: *Self) !Key {
-            while (self.recycle.pop(self.mem)) |rec_key| {
-                if (rec_key.index < self.items.len and !self.valid.isSet(rec_key.index)) {
-                    const gen = self.generation.items[rec_key.index] +% 1;
-                    self.generation.items[rec_key.index] = gen;
-                    return .{ .index = rec_key.index, .generation = gen };
-                }
-            }
-
-            if (self.items.len == self.items.capacity) {
-                std.debug.assert(self.items.len < std.math.maxInt(Index));
-                try self.items.ensureUnusedCapacity(self.mem, 1);
-                try self.valid.resize(self.mem, self.items.capacity, false);
-                try self.generation.ensureTotalCapacityPrecise(self.mem, self.items.capacity);
-            }
-
-            self.items.len += 1;
-            self.generation.items.len = self.items.len;
-            self.generation.items[self.items.len - 1] = 0;
-            return .{ .index = @as(u32, @intCast(self.items.len - 1)), .generation = 0 };
-        }
-
-        pub fn awaitNew(self: *Self) !Key {
-            self.mut.lock();
-            defer self.mut.unlock();
-            return self._awaitNew();
-        }
-
-        pub fn create(self: *Self, val: T) !Key {
-            const key = try self.awaitNew();
+    fn MutFunctions(comptime Slc: type) type { return struct {
+        pub inline fn create(self: *Slc, mem: Allocator, val: T) Allocator.Error!Key {
+            const key = try self.source.awaitNewLocked(mem);
+            // awaitNew can invalidate slices, refresh them before proceeding
+            if (is_multi) self.inner_slice = self.items.slice();
             self.set(key, val);
             return key;
         }
 
-        pub fn set(self: *Self, key: Key, val: T) void {
-            self.mut.lock();
-            defer self.mut.unlock();
-            self.items.set(key.index, val);
-            self.valid.set(key.index);
+        pub inline fn set(self: *Slc, key: Key, val: T) void {
+            if (is_multi) self.inner_slice.set(key.index, val) else self.source.items.items[key.index] = val;
+            self.living.set(key.index);
         }
 
-        pub fn destroy(self: *Self, key: Key) void {
-            self.mut.lock();
-            defer self.mut.unlock();
-            self.recycle.push(self.mem, key).?;
-            self.valid.unset(key.index);
-            if (key.index == self.items.len - 1) self.items.len -= 1;
+        pub inline fn destroy(self: *Slc, mem: Allocator, key: Key) void {
+            self.source.destroyLocked(mem, key);
+        }
+    };}
+
+    pub const SliceMut = struct {
+        source: *@This(),
+        inner_slice: if (is_multi) Items.Slice else void,
+        valid: bool,
+        rootValid: ?*bool,
+        release: fn (*SliceMut) void,
+
+        pub inline fn releaseInner(self: *SliceMut) void {
+            self.assertValid();
+            self.valid = false;
+            self.source.rw.unlockMut();
         }
 
-        pub fn clear(self: *Self) void {
-            self.mut.lock();
-            defer self.mut.unlock();
-            self.items.clearRetainingCapacity();
-            self.valid.unsetAll();
-            self.generation.clearRetainingCapacity();
-            self.recycle.clear();
+        pub inline fn releaseInnerDerived(_: *SliceMut) void {
+            comptime { @compileError("Attempt to release a slice that is derived from another. Release the root isntead."); }
         }
 
-        pub fn clearFree(self: *Self) void {
-            self.mut.lock();
-            defer self.mut.unlock();
-            self.items.clearAndFree(self.mem);
-            self.valid.resize(self.mem, 0, false).?;
-            self.generation.clearAndFree(self.mem);
-            self.recycle.clear();
-        }
+        const sliceFn = SliceFunctions(SliceMut);
+        pub const exists = sliceFn.exists;
+        pub const get = sliceFn.get;
+        pub const iter = sliceFn.iter;
+        const mutFn = MutFunctions(SliceMut);
+        pub const create = mutFn.create;
+        pub const set = mutFn.set;
+        pub const destroy = mutFn.destroy;
 
-        fn _get(self: *Self, key: Key) ?T {
-            if (self.exists(key)) return self.items.get(key.index);
+        pub inline fn iterMut(self: *SliceMut) void {
+            return .{
+                .source = self.source,
+                .inner_slice = self.inner_slice,
+                .index = 0,
+                .valid = true,
+                .rootValid = &(self.valid),
+                .release = IterMut.releaseInnerDerived
+            };
+        }
+    };
+
+    fn IterFunctions(comptime It: type) type { return struct {
+        pub fn next(self: *It) ?Key {
+            while (!self.done()) {
+                if (self.source.valid.isSet(self.index)) {
+                    const k: Key = .{ .index = self.index, .generation = self.source.generation.items[self.index] };
+                    self.index += 1;
+                    return k;
+                }
+                self.index += 1;
+            }
             return null;
         }
 
-        pub fn get(self: *Self, key: Key) ?T {
-            self.mut.lockShared();
-            defer self.mut.unlockShared();
-            return self._get(key);
+        pub inline fn done(self: *const It) bool {
+            return self.index >= self.source.len();
         }
 
-        pub fn trim(self: *Self) void {
-            if (self.items.len *| 2 >= self.items.capacity) return;
-            self.mut.lock();
-            defer self.mut.unlock();
-            self.items.shrinkAndFree(self.mem, @divFloor(self.items.capacity, 1));
-            std.debug.assert(self.items.capacity <= self.valid.bit_length);
-            self.valid.resize(self.mem, self.items.capacity, false) catch unreachable;
-            self.generation.shrinkAndFree(self.mem, self.items.capacity);
+        pub inline fn reset(self: *It) void {
+            self.index = 0;
         }
+
+        pub inline fn subIter(self: *const It) It {
+            return .{
+                .source = self.source,
+                .inner_slice = self.inner_slice,
+                .release = It.releaseInnerDerived
+            };
+        }
+    };}
+
+    pub const Iter = struct {
+        source: *@This(),
+        inner_slice: if (is_multi) Items.Slice else void,
+        index: Key.Index,
+        valid: bool,
+        rootValid: ?*bool,
+        release: fn (*const Iter) void,
+
+        pub inline fn releaseInner(self: *const Iter) void {
+            self.assertValid();
+            @constCast(self).valid = false;
+            self.source.rw.unlock();
+        }
+
+        pub inline fn releaseInnerDerived(_: *const Iter) void {
+            comptime { @compileError("Attempt to release a iterator that is derived from another. Release the root isntead."); }
+        }
+
+        const sliceFn = SliceFunctions(Iter);
+        pub const exists = sliceFn.exists;
+        pub const get = sliceFn.get;
+        const iterFn = IterFunctions(Iter);
+        pub const next = iterFn.next;
+        pub const done = iterFn.done;
+        pub const reset = iterFn.reset;
+        pub const subIter = iterFn.subIter;
     };
-}
 
+    pub const IterMut = struct {
+        source: *@This(),
+        inner_slice: if (is_multi) Items.Slice else void,
+        index: Key.Index,
+        valid: bool,
+        rootValid: ?*bool,
+        release: fn (*IterMut) void,
+
+        pub inline fn releaseInner(self: *IterMut) void {
+            self.assertValid();
+            self.valid = false;
+            self.source.rw.unlockMut();
+        }
+
+        pub inline fn releaseInnerDerived(_: *IterMut) void {
+            comptime { @compileError("Attempt to release a iterator that is derived from another. Release the root isntead."); }
+        }
+
+        const sliceFn = SliceFunctions(IterMut);
+        pub const exists = sliceFn.exists;
+        pub const get = sliceFn.get;
+        const mutFn = MutFunctions(IterMut);
+        pub const create = mutFn.create;
+        pub const destroy = mutFn.destroy;
+        pub const set = mutFn.set;
+        const iterFn = IterFunctions(IterMut);
+        pub const next = iterFn.next;
+        pub const done = iterFn.done;
+        pub const reset = iterFn.reset;
+        pub const subIter = iterFn.subIter;
+    };
+};}
