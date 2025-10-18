@@ -203,6 +203,112 @@ pub fn getOrPut(self: *RadixTable, mem: Allocator, slice: anytype) Allocator.Err
     }
 }
 
+pub const Reader = struct {
+    table: *RadixTable,
+    interface: std.Io.Reader,
+    cur_idx: usize,
+    end_idx: usize,
+
+    path: usize = 0,
+    path_len: u8 = 0,
+    bit_pos: u8 = 0,
+    byte_pos: usize = 0,
+    rem_len: usize = 0,
+    peeked: ?u1 = null,
+
+    pub inline fn release(self: *@This()) void {
+        self.table.rw.unlock();
+    }
+
+    pub fn peek(self: *@This()) ?u1 {
+        if (self.peeked) |p| return p;
+        self.peeked = self.next();
+        return self.peeked;
+    }
+
+    pub inline fn toss(self: *@This()) void {
+        if (self.peeked != null) {
+            self.peeked = null;
+        } else _ = self.next();
+    }
+
+    pub fn next(self: *@This()) ?u8 {
+        var cur: Node = self.table.nodes.items[self.cur_idx];
+        var out: std.bit_set.IntegerBitSet(8) = .initEmpty();
+        var out_pos: u16 = 8;
+        while (true) {
+            while (self.rem_len != 0) {
+                const is_set = (cur.bytes[self.byte_pos] & self.bit_pos) != 0;
+                self.bit_pos >>= 1;
+                self.rem_len -= 1;
+                if (self.bit_pos == 0) {
+                    self.byte_pos += 1;
+                    self.bit_pos = 0x80;
+                }
+                out_pos -= 1;
+                if (is_set) out.set(out_pos);
+                if (out_pos == 0) return out.mask;
+            }
+
+            if (self.cur_idx == self.end_idx) return null;
+
+            if (self.path_len == 0) {
+                var idx: usize = self.end_idx;
+                inner: while (true) {
+                    const parent_idx: usize = self.table.nodes.items[idx].parent.?;
+                    const parent: Node = self.table.nodes.items[parent_idx];
+                    if (parent.one == idx) {
+                        self.path |= 0x8000000000000000;
+                    }
+
+                    if (self.path_len < 64) self.path_len += 1;
+                    if (parent_idx == self.cur_idx) break :inner;
+
+                    self.path >>= 1;
+                    idx = parent_idx;
+                }
+            }
+
+            self.path, const dir = @shlWithOverflow(self.path, 1);
+            self.path_len -= 1;
+            self.cur_idx = if (dir == 1) cur.one.? else cur.zero.?;
+            cur = self.table.nodes.items[self.cur_idx];
+            self.byte_pos = cur.start_byte;
+            self.bit_pos = cur.start_bit;
+            self.rem_len = cur.bit_len;
+        }
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Reader = @alignCast(@fieldParentPtr("interface", reader));
+        var l: ?std.Io.Limit = limit;
+        var wrote: usize = 0;
+        while (l != null): (l = l.?.subtract(1)) {
+            try writer.writeByte(self.next() orelse return error.EndOfStream);
+            wrote += 1;
+        }
+        return wrote;
+    }
+};
+
+pub fn getReader(self: *RadixTable, idx: usize, buffer: []u8) Reader {
+    self.rw.lock();
+    const cur: Node = self.nodes.items[self.root];
+    return .{
+        .table = self,
+        .cur_idx = self.root,
+        .end_idx = idx,
+        .byte_pos = cur.start_byte,
+        .bit_pos = cur.start_bit,
+        .rem_len = cur.bit_len,
+        .interface = .{
+            .buffer = buffer,
+            .seek = 0, .end = 0,
+            .vtable = &.{ .stream = Reader.stream }
+        }
+    };
+}
+
 const test_mem = std.testing.allocator;
 
 test "RadixTable: Empty" {
@@ -385,4 +491,32 @@ test "RadixTable: Adding Prefix" {
         .zero = 1,
         .one = null
     }, table.nodes.items[2]);
+}
+
+test "RadixTable: Reconstruction" {
+    var table: RadixTable = .{};
+    defer table.deinit(test_mem);
+
+    const indexes = [_](struct { usize, []const u8 }){
+        .{ try table.getOrPut(test_mem, "abc"), "abc" },
+        .{ try table.getOrPut(test_mem, "a"), "a" },
+        .{ try table.getOrPut(test_mem, "adef"), "adef" },
+        .{ try table.getOrPut(test_mem, "bc"), "bc" },
+        .{ try table.getOrPut(test_mem, "def"), "def" },
+        .{ try table.getOrPut(test_mem, "efghi"), "efghi" }
+    };
+
+    var buf: [4096]u8 = undefined;
+
+    for (indexes) |index| {
+        const idx, const result = index;
+        var reader = table.getReader(idx, &[0]u8{});
+        defer reader.release();
+
+        var i: usize = 0;
+        while (reader.next()) |n|: (i += 1) buf[i] = n;
+
+        try std.testing.expectEqual(result.len, i);
+        try std.testing.expectEqualSlices(u8, result, buf[0..i]);
+    }
 }
