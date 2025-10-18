@@ -3,12 +3,16 @@ const std = @import("std");
 rw: std.Thread.RwLock = .{},
 snapshot: std.atomic.Value(usize) = .init(0),
 
-pub inline fn lock(self: *@This()) void {
-    self.rw.lockShared();
+pub inline fn lock(self: *const @This()) void {
+    @constCast(self).rw.lockShared();
 }
 
-pub inline fn tryLock(self: *@This()) bool {
-    return self.rw.tryLockShared();
+pub inline fn tryLock(self: *const @This()) bool {
+    return @constCast(self).rw.tryLockShared();
+}
+
+pub inline fn unlock(self: *const @This()) void {
+    @constCast(self).rw.unlockShared();
 }
 
 pub inline fn lockMut(self: *@This()) void {
@@ -17,10 +21,6 @@ pub inline fn lockMut(self: *@This()) void {
 
 pub inline fn tryLockMut(self: *@This()) bool {
     return self.rw.tryLock();
-}
-
-pub inline fn unlock(self: *@This()) void {
-    self.rw.unlockShared();
 }
 
 pub inline fn unlockMut(self: *@This()) void {

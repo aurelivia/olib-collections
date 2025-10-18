@@ -8,6 +8,7 @@ pub const Node = struct {
     bytes: []const u8,
     managed: bool,
     bit_len: usize,
+    total_bytes: usize,
     start_bit: u8,
     start_byte: usize = 0,
     parent: ?usize = null,
@@ -16,6 +17,10 @@ pub const Node = struct {
 
     pub fn deinit(self: *Node, mem: Allocator) void {
         if (self.managed) mem.free(self.bytes);
+    }
+
+    pub inline fn byteLen(self: *const Node) usize {
+        return (self.bit_len / 8) + @intFromBool(self.bit_len % 8 != 0);
     }
 };
 
@@ -50,6 +55,7 @@ pub fn getOrPut(self: *RadixTable, mem: Allocator, slice: anytype) Allocator.Err
             try self.nodes.append(mem, .{
                 .bytes = bytes,
                 .bit_len = bytes.len * 8,
+                .total_bytes = bytes.len,
                 .start_bit = 0x80,
                 .managed = true
             });
@@ -69,7 +75,7 @@ pub fn getOrPut(self: *RadixTable, mem: Allocator, slice: anytype) Allocator.Err
         var byte: usize = 0;
         var bit: u8 = root.start_bit;
 
-        const order: std.math.Order = inner: while (bit_len != 0) {
+        const ord: std.math.Order = inner: while (bit_len != 0) {
             const root_byte = root.bytes[root.start_byte + byte];
             const input_byte = input[input_start_byte + byte];
             if (bit == 0x80 and bit_len >= 8 and root_byte == input_byte) { bit_len -= 8; byte += 1; continue :inner; }
@@ -107,6 +113,7 @@ pub fn getOrPut(self: *RadixTable, mem: Allocator, slice: anytype) Allocator.Err
                     .bytes = bytes,
                     .managed = true,
                     .bit_len = (bytes.len * 8) - @clz(bit),
+                    .total_bytes = self.nodes.items[root_pos].total_bytes + bytes.len - @as(usize, if (bit != 0x80) 1 else 0),
                     .start_bit = bit
                 };
                 const new = self.nodes.items.len - 1;
@@ -130,6 +137,7 @@ pub fn getOrPut(self: *RadixTable, mem: Allocator, slice: anytype) Allocator.Err
                 .bytes = bytes,
                 .managed = false,
                 .bit_len = (bytes.len * 8) - @clz(root.start_bit) + @clz(bit),
+                .total_bytes = (if (parent_pos) |p| self.nodes.items[p].total_bytes else 0) + bytes.len - @as(usize, if (root.start_bit != 0x80) 1 else 0),
                 .start_bit = root.start_bit,
                 .start_byte = root.start_byte,
                 .zero = if (!dir) root_pos else null,
@@ -173,6 +181,7 @@ pub fn getOrPut(self: *RadixTable, mem: Allocator, slice: anytype) Allocator.Err
             .bytes = bytes,
             .managed = true,
             .bit_len = (remaining_bytes * 8) - @clz(bit),
+            .total_bytes = remaining_bytes - @as(usize, if (bit != 0x80) 1 else 0),
             .start_bit = bit
         };
         const pos = self.nodes.items.len - 1;
@@ -183,13 +192,16 @@ pub fn getOrPut(self: *RadixTable, mem: Allocator, slice: anytype) Allocator.Err
             .bytes = prefix,
             .managed = false,
             .bit_len = ((byte * 8) + @clz(bit)) - @clz(root.start_bit),
+            .total_bytes = (if (parent_pos) |p| self.nodes.items[p].total_bytes else 0) + byte + 1 - @as(usize, if (root.start_bit != 0x80) 1 else 0),
+
             .start_bit = root.start_bit,
-            .zero = if (order == .lt) root_pos else pos,
-            .one = if (order == .gt) root_pos else pos
+            .zero = if (ord == .lt) root_pos else pos,
+            .one = if (ord == .gt) root_pos else pos
         };
         const piv_pos = self.nodes.items.len - 1;
 
         self.nodes.items[pos].parent = piv_pos;
+        self.nodes.items[pos].total_bytes += pivot.total_bytes;
         self.nodes.items[root_pos].parent = piv_pos;
         self.nodes.items[root_pos].start_byte += pivot.bit_len / 8;
         self.nodes.items[root_pos].start_bit = bit;
@@ -204,7 +216,7 @@ pub fn getOrPut(self: *RadixTable, mem: Allocator, slice: anytype) Allocator.Err
 }
 
 pub const Reader = struct {
-    table: *RadixTable,
+    table: *const RadixTable,
     interface: std.Io.Reader,
     cur_idx: usize,
     end_idx: usize,
@@ -216,7 +228,7 @@ pub const Reader = struct {
     rem_len: usize = 0,
     peeked: ?u1 = null,
 
-    pub inline fn release(self: *@This()) void {
+    pub inline fn release(self: *const @This()) void {
         self.table.rw.unlock();
     }
 
@@ -291,7 +303,7 @@ pub const Reader = struct {
     }
 };
 
-pub fn getReader(self: *RadixTable, idx: usize, buffer: []u8) Reader {
+pub fn getReader(self: *const RadixTable, idx: usize, buffer: []u8) Reader {
     self.rw.lock();
     const cur: Node = self.nodes.items[self.root];
     return .{
@@ -309,6 +321,119 @@ pub fn getReader(self: *RadixTable, idx: usize, buffer: []u8) Reader {
     };
 }
 
+pub fn order(self: *const RadixTable, lhs: usize, rhs: usize) std.math.Order {
+    if (lhs == rhs) return .eq;
+    self.rw.lock();
+    defer self.rw.unlock();
+
+    var diff: std.math.Order = .eq;
+
+    var a_idx: ?usize = lhs;
+    var an: Node = self.nodes.items[lhs];
+    var a_tot: usize = an.total_bytes;
+    var al: usize = an.byteLen();
+    var b_idx: ?usize = rhs;
+    var bn: Node = self.nodes.items[rhs];
+    var b_tot: usize = bn.total_bytes;
+    var bl: usize = bn.byteLen();
+
+    const min_tot = @min(a_tot, b_tot);
+    while (a_tot > min_tot): (a_tot -= 1) {
+        al -= 1;
+        if (al == 0) {
+            a_idx = an.parent;
+            an = self.nodes.items[a_idx.?];
+            al = an.byteLen();
+        }
+    }
+    while (b_tot > min_tot): (b_tot -= 1) {
+        bl -= 1;
+        if (bl == 0) {
+            b_idx = bn.parent;
+            bn = self.nodes.items[b_idx.?];
+            bl = bn.byteLen();
+        }
+    }
+
+    std.debug.assert(a_tot == b_tot);
+
+    var as: []const u8 = an.bytes[an.start_byte .. (an.start_byte + al)];
+    var bs: []const u8 = bn.bytes[bn.start_byte .. (bn.start_byte + bl)];
+    var a: usize = al - 1;
+    var b: usize = bl - 1;
+
+    var bit: u8 = 0;
+
+    while (true) {
+        if (a_idx == b_idx) break;
+
+        if (bit == 0) {
+            if ((a != 0 or an.start_bit == 0x80) and (b != 0 or bn.start_bit == 0x80)) {
+                const byte_diff = std.math.order(as[a], bs[b]);
+                if (a == 0) {
+                    a_idx = an.parent;
+                    if (a_idx) |idx| {
+                        an = self.nodes.items[idx];
+                        a = an.byteLen();
+                        as = an.bytes[an.start_byte..(an.start_byte + a)];
+                        al += a;
+                        a -= 1;
+                    }
+                } else a -= 1;
+                if (b == 0) {
+                    b_idx = bn.parent;
+                    if (b_idx) |idx| {
+                        bn = self.nodes.items[idx];
+                        b = bn.byteLen();
+                        bs = bn.bytes[bn.start_byte..(bn.start_byte + b)];
+                        bl += b;
+                        b -= 1;
+                    }
+                } else b -= 1;
+                if (byte_diff != .eq) diff = byte_diff;
+                if (a_idx == null or b_idx == null) break;
+                continue;
+            } else bit = 1;
+        }
+
+        const d = std.math.order(as[a] & bit, bs[b] & bit);
+        if (d != .eq) diff = d;
+
+        if (a == 0 and bit == an.start_bit) {
+            a_idx = an.parent;
+            if (a_idx) |idx| {
+                an = self.nodes.items[idx];
+                a = an.byteLen();
+                as = an.bytes[an.start_byte..(an.start_byte + a)];
+                al += a;
+                a -= 1;
+            }
+        }
+
+        if (b == 0 and bit == bn.start_bit) {
+            b_idx = bn.parent;
+            if (b_idx) |idx| {
+                bn = self.nodes.items[idx];
+                b = bn.byteLen();
+                bs = bn.bytes[bn.start_byte..(bn.start_byte + b)];
+                bl += b;
+                b -= 1;
+            }
+        }
+
+        if (a_idx == null or b_idx == null) break;
+
+        bit <<= 1;
+    }
+
+    if (diff == .eq) {
+        const byte_diff = std.math.order(self.nodes.items[lhs].total_bytes, self.nodes.items[rhs].total_bytes);
+        if (byte_diff == .eq) return std.math.order(self.nodes.items[lhs].bit_len, self.nodes.items[rhs].bit_len);
+        return byte_diff;
+    }
+    return diff;
+}
+
 const test_mem = std.testing.allocator;
 
 test "RadixTable: Empty" {
@@ -322,6 +447,7 @@ test "RadixTable: Empty" {
         .bytes = "a",
         .managed = true,
         .bit_len = 8,
+        .total_bytes = 1,
         .start_bit = 0x80,
         .start_byte = 0,
         .parent = null,
@@ -345,60 +471,66 @@ test "RadixTable: Common Prefix" {
     try std.testing.expectEqual(6, table.nodes.items.len);
     try std.testing.expectEqual(3, table.root);
 
-    try std.testing.expectEqualDeep(Node{
+    try std.testing.expectEqualDeep(Node{ // 0
         .bytes = "abc",
         .managed = true,
         .bit_len = 3,
+        .total_bytes = 3,
         .start_bit = 0b00000100,
         .start_byte = 2,
         .parent = 5,
         .zero = null,
         .one = null
     }, table.nodes.items[0]);
-    try std.testing.expectEqualDeep(Node{
+    try std.testing.expectEqualDeep(Node{ // 1
         .bytes = "a",
         .managed = false,
         .bit_len = 2,
+        .total_bytes = 1,
         .start_bit = 0b00000010,
         .start_byte = 0,
         .parent = 3,
         .zero = 5,
         .one = null
     }, table.nodes.items[1]);
-    try std.testing.expectEqualDeep(Node{
+    try std.testing.expectEqualDeep(Node{ // 2
         .bytes = "be",
         .managed = true,
         .bit_len = 10,
+        .total_bytes = 2,
         .start_bit = 0b00000010,
         .start_byte = 0,
         .parent = 3,
         .zero = null,
         .one = null
     }, table.nodes.items[2]);
-    try std.testing.expectEqualDeep(Node{
+    try std.testing.expectEqualDeep(Node{ // 3
         .bytes = "a",
         .managed = false,
         .bit_len = 6,
+        .total_bytes = 1,
         .start_bit = 0x80,
         .start_byte = 0,
         .parent = null,
         .zero = 1,
         .one = 2
     }, table.nodes.items[3]);
-    try std.testing.expectEqualDeep(Node{
+    try std.testing.expectEqualDeep(Node{ // 4
         .bytes = "d",
         .managed = true,
         .bit_len = 3,
+        .total_bytes = 3,
         .start_bit = 0b00000100,
         .start_byte = 0,
         .parent = 5,
         .zero = null,
         .one = null
     }, table.nodes.items[4]);
-    try std.testing.expectEqualDeep(Node{
+    try std.testing.expectEqualDeep(Node{ // 5
         .bytes = "bc",
         .managed = false,
         .bit_len = 13,
+        .total_bytes = 3,
         .start_bit = 0x80,
         .start_byte = 0,
         .parent = 1,
@@ -422,6 +554,7 @@ test "RadixTable: Adding Branch" {
         .bytes = "a",
         .managed = true,
         .bit_len = 8,
+        .total_bytes = 1,
         .start_bit = 0x80,
         .start_byte = 0,
         .parent = null,
@@ -432,6 +565,7 @@ test "RadixTable: Adding Branch" {
         .bytes = "b",
         .managed = true,
         .bit_len = 8,
+        .total_bytes = 2,
         .start_bit = 0x80,
         .start_byte = 0,
         .parent = 0,
@@ -442,6 +576,7 @@ test "RadixTable: Adding Branch" {
         .bytes = &[1]u8{ 0x80 },
         .managed = true,
         .bit_len = 8,
+        .total_bytes = 2,
         .start_bit = 0x80,
         .start_byte = 0,
         .parent = 0,
@@ -465,6 +600,7 @@ test "RadixTable: Adding Prefix" {
         .bytes = "abc",
         .managed = true,
         .bit_len = 8,
+        .total_bytes = 3,
         .start_bit = 0x80,
         .start_byte = 2,
         .parent = 1,
@@ -475,6 +611,7 @@ test "RadixTable: Adding Prefix" {
         .bytes = "ab",
         .managed = false,
         .bit_len = 8,
+        .total_bytes = 2,
         .start_bit = 0x80,
         .start_byte = 1,
         .parent = 2,
@@ -485,6 +622,7 @@ test "RadixTable: Adding Prefix" {
         .bytes = "a",
         .managed = false,
         .bit_len = 8,
+        .total_bytes = 1,
         .start_bit = 0x80,
         .start_byte = 0,
         .parent = null,
@@ -518,5 +656,30 @@ test "RadixTable: Reconstruction" {
 
         try std.testing.expectEqual(result.len, i);
         try std.testing.expectEqualSlices(u8, result, buf[0..i]);
+    }
+}
+
+test "RadixTable: Ordering" {
+    var table: RadixTable = .{};
+    defer table.deinit(test_mem);
+
+    const indexes = [_](struct { usize, []const u8 }){
+        .{ try table.getOrPut(test_mem, "abc"), "abc" },
+        .{ try table.getOrPut(test_mem, "a"), "a" },
+        .{ try table.getOrPut(test_mem, "adef"), "adef" },
+        .{ try table.getOrPut(test_mem, "bc"), "bc" },
+        .{ try table.getOrPut(test_mem, "def"), "def" },
+        .{ try table.getOrPut(test_mem, "efghi"), "efghi" }
+    };
+
+    for (indexes) |a| {
+        const a_idx, const a_val = a;
+        for (indexes) |b| {
+            const b_idx, const b_val = b;
+            std.testing.expectEqual(std.mem.order(u8, a_val, b_val), table.order(a_idx, b_idx)) catch |e| {
+                std.debug.print("Test {s} {s}\n", .{ a_val, b_val });
+                return e;
+            };
+        }
     }
 }
