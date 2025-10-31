@@ -6,7 +6,7 @@ pub fn SparseArrayList(comptime T: type) type { return struct {
     const Self = @This();
 
     const is_optional = @typeInfo(T) == .optional;
-    const Known = if (is_optional) @typeInfo(T).child else T;
+    const Known = if (is_optional) @typeInfo(T).optional.child else T;
 
     pub const LookupResult = if (is_optional) T else ?T;
 
@@ -23,7 +23,7 @@ pub fn SparseArrayList(comptime T: type) type { return struct {
 
         const init_cap: comptime_int = @max(1, std.atomic.cache_line / @sizeOf(T));
 
-        pub fn init(mem: Allocator, offset: usize, val: Known) OOM!Self {
+        pub fn init(mem: Allocator, offset: usize, val: Known) OOM!Slice {
             const slice = try mem.alloc(Known, init_cap);
             slice[0] = val;
             return .{
@@ -132,12 +132,41 @@ pub fn SparseArrayList(comptime T: type) type { return struct {
             return slice.ptr[index - slice.offset];
         } else return null;
     }
+
+    pub fn append(self: *Self, mem: Allocator, val: T) Allocator.Error!void {
+        const known: Known = if (is_optional) (if (val) |v| v else {
+            self.trailing_nulls += 1;
+            return;
+        }) else val;
+
+        if (self.inner.items.len == 0) {
+            var slice: Slice = try .init(mem, 0, known);
+            errdefer slice.deinit(mem);
+            return try self.inner.append(mem, slice);
+        }
+
+        if (is_optional) {
+            if (self.trailing_nulls != 0) {
+                var slice: Slice = try .init(mem, self.len(), known);
+                errdefer slice.deinit(mem);
+                try self.inner.append(mem, slice);
+                self.trailing_nulls = 0;
+                return;
+            }
+        }
+
+        var last = &(self.inner.items[self.inner.items.len - 1]);
+        if (!(try last.ensureCapacity(mem, last.len + 1, std.math.maxInt(u32)))) return error.OutOfMemory;
+        last.ptr[last.len] = known;
+        last.len += 1;
+    }
 };}
 
 const tst = std.testing;
 const test_mem = std.testing.allocator;
 
 const TestUnbounded = SparseArrayList(usize);
+const TestBounded = SparseArrayList(?usize);
 
 test "Slice Capacity" {
     var t: TestUnbounded = try .initCapacity(test_mem, 1);
@@ -161,7 +190,7 @@ test "Slice Capacity" {
     try tst.expectEqual(130, t.inner.items[0].cap);
 }
 
-fn appendTestSlice(t: *TestUnbounded, off: usize, len: u32) OOM!void {
+fn appendTestSlice(comptime T: type, t: *T, off: usize, len: u32) OOM!void {
     const slice = try test_mem.alloc(usize, len);
     for (0..slice.len) |i| slice[i] = i + off;
     errdefer test_mem.free(slice);
@@ -173,21 +202,21 @@ fn appendTestSlice(t: *TestUnbounded, off: usize, len: u32) OOM!void {
     });
 }
 
-fn makeTestList() OOM!TestUnbounded {
-    var t: TestUnbounded = .empty;
+fn makeTestList(comptime T: type) OOM!T {
+    var t: T = .empty;
     errdefer t.deinit(test_mem);
 
-    try appendTestSlice(&t, 0, 1);
-    try appendTestSlice(&t, 4, 2);
-    try appendTestSlice(&t, 8, 4);
-    try appendTestSlice(&t, 16, 8);
-    try appendTestSlice(&t, 32, 16);
+    try appendTestSlice(T, &t, 0, 1);
+    try appendTestSlice(T, &t, 4, 2);
+    try appendTestSlice(T, &t, 8, 4);
+    try appendTestSlice(T, &t, 16, 8);
+    try appendTestSlice(T, &t, 32, 16);
 
     return t;
 }
 
 test "Get" {
-    var t: TestUnbounded = try makeTestList();
+    var t: TestUnbounded = try makeTestList(TestUnbounded);
     defer t.deinit(test_mem);
 
     try tst.expectEqual(0, t.get(0));
@@ -197,4 +226,30 @@ test "Get" {
         for (0..l) |i| try tst.expectEqual(s + i, t.get(s + i));
         for (l..s) |i| try tst.expectEqual(null, t.get(s + i));
     }
+}
+
+test "Append" {
+    var u: TestUnbounded = try makeTestList(TestUnbounded);
+    defer u.deinit(test_mem);
+
+    try tst.expectEqual(null, u.get(32 + 16));
+    try u.append(test_mem, 999);
+    try tst.expectEqual(999, u.get(32 + 16));
+
+    var b: TestBounded = try makeTestList(TestBounded);
+    defer b.deinit(test_mem);
+
+    try tst.expectEqual(32 + 16, b.len());
+    try b.append(test_mem, null);
+    try tst.expectEqual(32 + 17, b.len());
+    try tst.expectEqual(null, b.get(32 + 16));
+    try b.append(test_mem, null);
+    try b.append(test_mem, null);
+    try b.append(test_mem, null);
+    try b.append(test_mem, null);
+    try tst.expectEqual(5, b.trailing_nulls);
+    try b.append(test_mem, 999);
+    try tst.expectEqual(0, b.trailing_nulls);
+    try tst.expectEqual(32 + 22, b.len());
+    try tst.expectEqual(999, b.get(32 + 21));
 }
